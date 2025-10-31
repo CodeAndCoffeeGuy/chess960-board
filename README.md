@@ -4,23 +4,23 @@ A custom React chess board component optimized for Chess960 (Fischer Random Ches
 
 ## Features
 
-- ✅ **Native Chess960 Support** - Proper FEN handling with correct piece placement
-- ✅ **Customizable Themes** - Board colors and piece sets
-- ✅ **Orientation Control** - View from white or black perspective
-- ✅ **Read-only Mode** - Perfect for spectator/featured games
-- ✅ **Smooth Animations** - Configurable move animations with ghost piece during drag
-- ✅ **Interactive Features** - Drag & drop, arrow drawing, premoves, promotion support
-- ✅ **Rook Castling UI** - Castling by clicking the rook
-- ✅ **Keyboard Input** - Enter moves using keyboard (UCI/SAN notation)
-- ✅ **Touch Optimizations** - Configurable touch ignore radius for mobile
-- ✅ **Move Sounds** - Audio feedback for different move types
-- ✅ **Click-to-Move Mode** - Alternative to drag & drop input method
-- ✅ **Blindfold Mode** - Hide pieces for blindfold training
-- ✅ **Resize Handle** - Dynamically resize the board
-- ✅ **Erase Arrows on Click** - Remove arrows by clicking them
-- ✅ **TypeScript** - Fully typed with comprehensive type definitions
-- ✅ **Zero Dependencies** - Only peer dependencies (React, chess.js)
-- ✅ **Framework Agnostic** - Works with any React setup (Next.js, Vite, etc.)
+-  **Native Chess960 Support** - Proper FEN handling with correct piece placement
+-  **Customizable Themes** - Board colors and piece sets
+-  **Orientation Control** - View from white or black perspective
+-  **Read-only Mode** - Perfect for spectator/featured games
+-  **Smooth Animations** - Configurable move animations with ghost piece during drag
+-  **Interactive Features** - Drag & drop, arrow drawing, premoves, promotion support
+-  **Rook Castling UI** - Castling by clicking the rook
+-  **Keyboard Input** - Enter moves using keyboard (UCI/SAN notation)
+-  **Touch Optimizations** - Configurable touch ignore radius for mobile
+-  **Move Sounds** - Audio feedback for different move types
+-  **Click-to-Move Mode** - Alternative to drag & drop input method
+-  **Blindfold Mode** - Hide pieces for blindfold training
+-  **Resize Handle** - Dynamically resize the board
+-  **Erase Arrows on Click** - Remove arrows by clicking them
+-  **TypeScript** - Fully typed with comprehensive type definitions
+-  **Zero Dependencies** - Only peer dependencies (React, chess.js)
+-  **Framework Agnostic** - Works with any React setup (Next.js, Vite, etc.)
 
 ## Installation
 
