@@ -15,8 +15,7 @@
   "types": "./dist/index.d.ts",
   "repository": {
     "type": "git",
-    "url": "https://github.com/CodeAndCoffeeGuy/chess960.git",
-    "directory": "packages/chess960-board"
+    "url": "https://github.com/nikostojak/chess960-board.git"
   },
   "exports": {
     ".": {
