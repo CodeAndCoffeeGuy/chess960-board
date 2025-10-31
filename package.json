@@ -31,7 +31,9 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "example": "cd example && npm install && npm run dev",
+    "example:build": "cd example && npm install && npm run build"
   },
   "peerDependencies": {
     "react": ">=18.0.0",

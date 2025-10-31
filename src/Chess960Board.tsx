@@ -146,6 +146,13 @@ export function Chess960Board({
   const [isResizing, setIsResizing] = useState(false);
   const resizeStartRef = useRef<{ x: number; y: number; width: number } | null>(null);
   
+  // User interaction stats - track whether user prefers dragging or clicking
+  // Default to dragging on desktop, clicking on touch devices
+  const [userPrefersDrag, setUserPrefersDrag] = useState<boolean>(!('ontouchstart' in window));
+  
+  // Drag distance threshold - minimum pixels to move before starting drag (default 3px)
+  const dragDistanceThreshold = 3;
+  
   // Update internal width when prop changes
   useEffect(() => {
     setInternalWidth(width);
@@ -157,6 +164,7 @@ export function Chess960Board({
   // Determine if drag should be enabled based on moveInputMode
   const isDragEnabled = moveInputMode === 'drag' || moveInputMode === 'both';
   const isClickEnabled = moveInputMode === 'click' || moveInputMode === 'both';
+  
   
   // Check if king is in check
   const isInCheck = useCallback(() => {
@@ -226,113 +234,284 @@ export function Chess960Board({
     return board;
   }, []);
 
-  // Update board state when FEN changes and detect moves for animation
-  useEffect(() => {
-    if (fen) {
-      try {
-        const previousFen = chess.fen();
-        chess.load(fen);
-        const newBoardState = parseFen(fen);
-        
-        // Only animate if we have a previous state and animations are enabled
-        if (previousBoardState.length > 0 && animationDuration > 0 && previousFen !== fen) {
-          detectAndAnimateMoves(previousBoardState, newBoardState);
-        }
-        
-        setPreviousBoardState(boardState.length > 0 ? [...boardState] : newBoardState);
-        setBoardState(newBoardState);
-      } catch (error) {
-        console.error('[Chess960Board] Error loading FEN:', fen, error);
-        // Fallback to standard starting position
-        chess.reset();
-        const newBoardState = parseFen(chess.fen());
-        setPreviousBoardState(boardState.length > 0 ? [...boardState] : newBoardState);
-        setBoardState(newBoardState);
-      }
-    } else {
-      // If no FEN provided, use standard starting position
-      chess.reset();
-      const newBoardState = parseFen(chess.fen());
-      setPreviousBoardState(boardState.length > 0 ? [...boardState] : newBoardState);
-      setBoardState(newBoardState);
-    }
-  }, [fen, chess, parseFen, animationDuration]);
-
-  // Detect moves and set up animations - simplified version
-  const detectAndAnimateMoves = useCallback((oldBoard: Piece[][], newBoard: Piece[][]) => {
-    const animating = new Map<string, { from: Square; to: Square; piece: Piece }>();
-    const captured = new Map<string, { square: Square; piece: Piece }>();
-    
-    // Simple approach: find pieces in new board and check if they moved
-    const piecesMovedFrom = new Set<string>();
-    
-    for (let rank = 0; rank < 8; rank++) {
-      for (let file = 0; file < 8; file++) {
-        const oldPiece = oldBoard[rank]?.[file];
-        const newPiece = newBoard[rank]?.[file];
-        const square = rankFileToSquare(rank, file);
-        
-        // Check if piece at this square changed
-        if (oldPiece && (!newPiece || newPiece.color !== oldPiece.color || newPiece.type !== oldPiece.type)) {
-          // Piece was removed from this square - check if it moved or was captured
-          let moved = false;
-          
-          // Search for same piece in new board at a different square
-          for (let newRank = 0; newRank < 8; newRank++) {
-            for (let newFile = 0; newFile < 8; newFile++) {
-              const testPiece = newBoard[newRank]?.[newFile];
-              if (testPiece && testPiece.color === oldPiece.color && testPiece.type === oldPiece.type) {
-                const newSquare = rankFileToSquare(newRank, newFile);
-                if (newSquare !== square) {
-                  // Found the piece at a new location - it moved
-                  const animKey = `${newSquare}-${oldPiece.color}-${oldPiece.type}`;
-                  animating.set(animKey, {
-                    from: square,
-                    to: newSquare,
-                    piece: oldPiece,
-                  });
-                  piecesMovedFrom.add(square);
-                  moved = true;
-                  break;
-                }
-              }
-            }
-            if (moved) break;
-          }
-          
-          // If piece wasn't found elsewhere, it was captured
-          if (!moved) {
-            captured.set(square, { square, piece: oldPiece });
-          }
-        }
-      }
-    }
-    
-    setAnimatingPieces(animating);
-    setCapturedPieces(captured);
-    
-    // Clear animations after duration
-    if (animating.size > 0 || captured.size > 0) {
-      setTimeout(() => {
-        setAnimatingPieces(new Map());
-        setCapturedPieces(new Map());
-      }, animationDuration);
-    }
-  }, [rankFileToSquare, animationDuration]);
-
-  // Get square color (light or dark)
-  const getSquareColor = useCallback((rank: number, file: number): 'light' | 'dark' => {
-    return (rank + file) % 2 === 0 ? 'dark' : 'light';
-  }, []);
-
-
-  // Convert square notation to rank/file
+  // Convert square notation to rank/file (defined early for use in detectAndAnimateMoves)
   const squareToRankFile = useCallback((square: Square): { rank: number; file: number } => {
     const file = square.charCodeAt(0) - 97; // 'a' = 0
     const rank = 8 - parseInt(square[1]); // '8' = 0, '1' = 7
     return { rank, file };
   }, []);
 
+  // Detect moves and set up animations - only animate the ONE actual move
+  const detectAndAnimateMoves = useCallback((oldBoard: Piece[][], newBoard: Piece[][]) => {
+    // Only animate if exactly ONE piece moved (to avoid re-animating old moves)
+    let moveCount = 0;
+    let capturedCount = 0;
+    const animating = new Map<string, { from: Square; to: Square; piece: Piece }>();
+    const captured = new Map<string, { square: Square; piece: Piece }>();
+    
+    // Track squares that had pieces removed
+    const squaresWithRemovedPieces = new Map<Square, Piece>();
+    
+    // Track squares that have new pieces (or changed pieces)
+    const squaresWithNewPieces = new Map<Square, Piece>();
+    
+    // First pass: identify squares where pieces disappeared or changed
+    for (let rank = 0; rank < 8; rank++) {
+      for (let file = 0; file < 8; file++) {
+        const oldPiece = oldBoard[rank]?.[file];
+        const newPiece = newBoard[rank]?.[file];
+        const square = rankFileToSquare(rank, file);
+        
+        if (oldPiece) {
+          // Check if piece changed or disappeared
+          if (!newPiece || newPiece.color !== oldPiece.color || newPiece.type !== oldPiece.type) {
+            squaresWithRemovedPieces.set(square, oldPiece);
+          }
+        }
+        
+        if (newPiece) {
+          // Check if piece is new or changed at this square
+          if (!oldPiece || oldPiece.color !== newPiece.color || oldPiece.type !== newPiece.type) {
+            squaresWithNewPieces.set(square, newPiece);
+          }
+        }
+      }
+    }
+    
+    // Only proceed if we have exactly one move (one removed piece, one or zero new pieces)
+    // This prevents re-animating pieces that were already moved
+    if (squaresWithRemovedPieces.size !== 1 || squaresWithNewPieces.size > 1) {
+      // Too many changes - don't animate (likely a position reset or multiple moves)
+      return;
+    }
+    
+    // Second pass: match removed piece with new piece
+    const matchedSquares = new Set<Square>();
+    
+    for (const [fromSquare, removedPiece] of squaresWithRemovedPieces.entries()) {
+      let matched = false;
+      
+      // Look for this piece at a new location
+      const candidates: Array<{ square: Square; piece: Piece; distance: number }> = [];
+      
+      for (const [toSquare, newPiece] of squaresWithNewPieces.entries()) {
+        // Skip if this square is already matched
+        if (matchedSquares.has(toSquare)) continue;
+        
+        // Check if pieces match (same color and type)
+        if (removedPiece.color === newPiece.color && removedPiece.type === newPiece.type) {
+          // Calculate distance (Manhattan distance)
+          const fromCoords = squareToRankFile(fromSquare);
+          const toCoords = squareToRankFile(toSquare);
+          const distance = Math.abs(fromCoords.rank - toCoords.rank) + Math.abs(fromCoords.file - toCoords.file);
+          candidates.push({ square: toSquare, piece: newPiece, distance });
+        }
+      }
+      
+      // Sort by distance (closest first) and take the best match
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => a.distance - b.distance);
+        const bestMatch = candidates[0];
+        
+        // Only animate if the square actually changed
+        if (bestMatch.square !== fromSquare) {
+          const animKey = `${bestMatch.square}-${removedPiece.color}-${removedPiece.type}`;
+          animating.set(animKey, {
+            from: fromSquare,
+            to: bestMatch.square,
+            piece: removedPiece,
+          });
+          matchedSquares.add(bestMatch.square);
+          matched = true;
+          moveCount++;
+        }
+      }
+      
+      // If no match found, piece was captured
+      if (!matched) {
+        captured.set(fromSquare, { square: fromSquare, piece: removedPiece });
+        capturedCount++;
+      }
+    }
+    
+    // Only set animations if we have exactly one move
+    if (moveCount === 1 || (moveCount === 0 && capturedCount === 1)) {
+      setAnimatingPieces(animating);
+      setCapturedPieces(captured);
+      
+      // Clear animations after duration
+      if (animating.size > 0 || captured.size > 0) {
+        setTimeout(() => {
+          setAnimatingPieces(new Map());
+          setCapturedPieces(new Map());
+        }, animationDuration);
+      }
+    }
+  }, [rankFileToSquare, animationDuration, squareToRankFile]);
+
+  // Update board state when FEN changes and detect moves for animation
+  // Use refs to avoid infinite loops from state dependencies
+  const boardStateRef = useRef<Piece[][]>(boardState);
+  const previousBoardStateRef = useRef<Piece[][]>(previousBoardState);
+  const lastFenRef = useRef<string | undefined>(undefined); // Start with undefined so first render always runs
+  
+  // Keep refs in sync with state (separate effects to avoid loops)
+  useEffect(() => {
+    boardStateRef.current = boardState;
+  }, [boardState]);
+  
+  useEffect(() => {
+    previousBoardStateRef.current = previousBoardState;
+  }, [previousBoardState]);
+
+  // Helper to normalize FEN for comparison (ignore move counters)
+  const normalizeFen = useCallback((fenStr: string): string => {
+    // Remove move counters at the end for comparison
+    // FEN format: "position w/b castling enpassant halfmove fullmove"
+    // We only care about the position part for visual comparison
+    const parts = fenStr.split(' ');
+    if (parts.length >= 4) {
+      return parts.slice(0, 4).join(' ');
+    }
+    return fenStr;
+  }, []);
+
+  // Track if we have an optimistic update in progress
+  const optimisticUpdateRef = useRef<boolean>(false);
+  // Store the FEN before optimistic update so we can detect reverts
+  const preOptimisticFenRef = useRef<string | undefined>(undefined);
+  // Track if a drop was successfully handled (to prevent dragEnd from clearing state)
+  const dropHandledRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    // Normalize FENs for comparison (ignore move counters)
+    const normalizedFen = fen ? normalizeFen(fen) : undefined;
+    const normalizedLastFen = lastFenRef.current ? normalizeFen(lastFenRef.current) : undefined;
+    
+    
+    // CRITICAL: If we have an optimistic update active, protect boardState from being overwritten
+    if (optimisticUpdateRef.current && preOptimisticFenRef.current) {
+      const currentChessFen = chess.fen();
+      const currentNormalized = normalizeFen(currentChessFen);
+      const preOptimisticFenNormalized = normalizeFen(preOptimisticFenRef.current);
+      
+      
+      // If incoming FEN matches our optimistic chess instance, parent confirmed the move
+      if (normalizedFen === currentNormalized && fen) {
+        // Parent confirmed - clear optimistic flag but don't reload (already correct)
+        optimisticUpdateRef.current = false;
+        preOptimisticFenRef.current = undefined;
+        // Update chess instance silently without reloading board
+        chess.load(fen);
+        lastFenRef.current = fen;
+        return; // Don't update boardState - it's already correct
+      }
+      
+          // If incoming FEN matches pre-optimistic FEN, it's trying to revert - reject it
+          if (normalizedFen === preOptimisticFenNormalized) {
+            // DO NOT update boardState - keep our optimistic position
+        return; // Keep our optimistic boardState
+      }
+      
+          // Incoming FEN is different - probably a new position, accept it
+          optimisticUpdateRef.current = false;
+      preOptimisticFenRef.current = undefined;
+      // Fall through to update boardState normally
+    }
+    
+    // Only run if FEN actually changed (but allow first render)
+    if (normalizedFen === normalizedLastFen) {
+      return;
+    }
+    
+    // Update lastFenRef to the actual fen (not normalized) for next comparison
+    lastFenRef.current = fen;
+    
+    if (fen) {
+      try {
+        // CRITICAL: If we have an optimistic update, protect boardState from being overwritten
+        if (optimisticUpdateRef.current) {
+          const currentChessFen = chess.fen();
+          const currentNormalized = normalizeFen(currentChessFen);
+          const preOptimisticFenNormalized = normalizeFen(preOptimisticFenRef.current || '');
+          
+          // If incoming FEN matches our optimistic chess instance, parent confirmed the move
+          if (normalizedFen === currentNormalized) {
+            // Parent confirmed - clear optimistic flag but don't reload (already correct)
+            optimisticUpdateRef.current = false;
+            preOptimisticFenRef.current = undefined;
+            // Update chess instance silently without reloading board
+            chess.load(fen);
+            return; // Don't update boardState - it's already correct
+          }
+          
+          // If incoming FEN matches pre-optimistic FEN, it's trying to revert - reject it
+          if (normalizedFen === preOptimisticFenNormalized) {
+            return; // Keep our optimistic boardState
+          }
+          
+          // Incoming FEN is different - probably a new position, accept it
+          optimisticUpdateRef.current = false;
+          preOptimisticFenRef.current = undefined;
+          // Fall through to update boardState normally
+        }
+        
+        const previousFen = chess.fen();
+        chess.load(fen);
+        const newBoardState = parseFen(fen);
+        
+        // Use refs to get current state without adding to dependencies
+        const currentBoardState = boardStateRef.current;
+        const currentPreviousBoardState = previousBoardStateRef.current;
+        
+        // Only animate if we have a previous state and animations are enabled
+        // AND the position actually changed (not just move counters)
+        const normalizedPreviousFen = previousFen ? normalizeFen(previousFen) : undefined;
+        if (currentPreviousBoardState.length > 0 && animationDuration > 0 && normalizedPreviousFen !== normalizedFen) {
+          // Make a deep copy of previous state for comparison
+          const prevBoardCopy = currentPreviousBoardState.map(rank => rank.map(piece => piece ? { ...piece } : null)) as Piece[][];
+          detectAndAnimateMoves(prevBoardCopy, newBoardState);
+        }
+        
+        // Update previous state to current before updating current
+        const prevStateCopy = currentBoardState.length > 0 
+          ? (currentBoardState.map(rank => rank.map(piece => piece ? { ...piece } : null)) as Piece[][])
+          : newBoardState;
+        setPreviousBoardState(prevStateCopy);
+        setBoardState(newBoardState);
+      } catch (error) {
+        console.error('[Chess960Board] Error loading FEN:', fen, error);
+        // Fallback to standard starting position
+        chess.reset();
+        const newBoardState = parseFen(chess.fen());
+        const currentBoardState = boardStateRef.current;
+        const prevStateCopy = currentBoardState.length > 0 
+          ? (currentBoardState.map(rank => rank.map(piece => piece ? { ...piece } : null)) as Piece[][])
+          : newBoardState;
+        setPreviousBoardState(prevStateCopy);
+        setBoardState(newBoardState);
+      }
+    } else {
+      // If no FEN provided, use standard starting position
+      chess.reset();
+      const newBoardState = parseFen(chess.fen());
+      const currentBoardState = boardStateRef.current;
+      const prevStateCopy = currentBoardState.length > 0 
+        ? (currentBoardState.map(rank => rank.map(piece => piece ? { ...piece } : null)) as Piece[][])
+        : newBoardState;
+      setPreviousBoardState(prevStateCopy);
+      setBoardState(newBoardState);
+    }
+  }, [fen, animationDuration, detectAndAnimateMoves, chess, parseFen, normalizeFen]); // Only depend on fen and stable callbacks
+
+  // Get square color (light or dark)
+  const getSquareColor = useCallback((rank: number, file: number): 'light' | 'dark' => {
+    return (rank + file) % 2 === 0 ? 'dark' : 'light';
+  }, []);
+
+  // State for right-click hover destination display
+  const [rightClickHoverSquare, setRightClickHoverSquare] = useState<Square | null>(null);
+  
   // Calculate legal moves for selected square
   const calculatedLegalMoves = useMemo(() => {
     if (!selectedSquare || readOnly || !showDestinations) return [];
@@ -344,11 +523,27 @@ export function Chess960Board({
     }
   }, [selectedSquare, chess, readOnly, showDestinations]);
   
+  // Calculate legal moves for right-click hover (shows destinations on right-click)
+  const rightClickLegalMoves = useMemo(() => {
+    if (!rightClickHoverSquare || readOnly || !showDestinations) return [];
+    try {
+      const moves = chess.moves({ square: rightClickHoverSquare as any, verbose: true });
+      return moves.map((move: any) => move.to);
+    } catch {
+      return [];
+    }
+  }, [rightClickHoverSquare, chess, readOnly, showDestinations]);
+  
   // Use provided legalMoves or calculate them
-  // Only show destinations if showDestinations is true
+  // Show destinations for selected square OR right-click hover square
   const effectiveLegalMoves = showDestinations 
-    ? (legalMoves.length > 0 ? legalMoves : calculatedLegalMoves)
+    ? (selectedSquare 
+        ? (legalMoves.length > 0 ? legalMoves : calculatedLegalMoves)
+        : rightClickLegalMoves)
     : [];
+  
+  // Square to show destinations for (either selected or right-click hover)
+  const destinationsSquare = selectedSquare || rightClickHoverSquare;
 
   // Sound helper function (defined early for use in handlers)
   const playSound = useCallback((soundType: 'move' | 'capture' | 'check' | 'castle' | 'promotion') => {
@@ -372,7 +567,15 @@ export function Chess960Board({
   
   // Handle square click with rook castling support and arrow erase
   const handleSquareClick = useCallback((rank: number, file: number, event?: React.MouseEvent | React.TouchEvent) => {
+    // Don't handle clicks if it was a right-click (button 2)
+    if (event && 'button' in event && (event as React.MouseEvent).button === 2) {
+      return; // Right-click is handled separately in handleRightClick
+    }
+    
     if (readOnly || !onMove) return;
+    
+    // Clear right-click hover destinations on left click
+    setRightClickHoverSquare(null);
     
     // Check for arrow erase first
     if (eraseArrowsOnClick && arrows.length > 0 && onArrowsChange) {
@@ -391,21 +594,42 @@ export function Chess960Board({
 
     const square = rankFileToSquare(rank, file);
     
+    // Check if this is a premove (not player's turn but premove enabled)
+    const isPremove = enablePremove && currentPlayerColor && 
+      chess.turn() !== (currentPlayerColor === 'white' ? 'w' : 'b');
+    
     if (selectedSquare) {
       // Try to make a move
       if (selectedSquare !== square) {
-        // Check if it's a legal move
-        if (effectiveLegalMoves.length === 0 || effectiveLegalMoves.includes(square)) {
-          // Determine move type for sound
+        // ALWAYS validate move with chess.js - don't trust effectiveLegalMoves alone
+        try {
+          const testChess = new Chess(chess.fen());
+          const move = testChess.move({ from: selectedSquare as any, to: square });
+          
+          if (!move) {
+            // Invalid move - deselect or select new piece
+            const newPiece = boardState[rank]?.[file];
+            if (newPiece) {
+              // Try selecting the clicked piece instead
+              if (externalSelectedSquare === undefined) {
+                setInternalSelectedSquare(square);
+              }
+            } else {
+              // Clicked empty square - clear selection
+              if (externalSelectedSquare === undefined) {
+                setInternalSelectedSquare(null);
+              }
+            }
+            return;
+          }
+          
+          // Move is valid - determine move type for sound
           const targetPiece = boardState[rank]?.[file];
-          const isCapture = !!targetPiece;
+          const isCapture = !!move.captured;
           const sourcePiece = chess.get(selectedSquare as any);
           const isPawn = sourcePiece?.type === 'p';
           const targetRank = square[1];
-          const isPromotion = isPawn && (
-            (sourcePiece?.color === 'w' && targetRank === '8') ||
-            (sourcePiece?.color === 'b' && targetRank === '1')
-          );
+          const isPromotion = !!move.promotion;
           
           // Try to detect castling
           let isCastle = false;
@@ -416,46 +640,74 @@ export function Chess960Board({
             }
           }
           
-          // Check if move puts opponent in check
-          try {
-            const testChess = new Chess(chess.fen());
-            const move = testChess.move({ from: selectedSquare as any, to: square });
-            if (move) {
-              const isCheck = testChess.inCheck();
-              
-              // Play appropriate sound
-              if (isCastle) {
-                playSound('castle');
-              } else if (isPromotion) {
-                playSound('promotion');
-              } else if (isCheck) {
-                playSound('check');
-              } else if (isCapture) {
-                playSound('capture');
-              } else {
-                playSound('move');
-              }
-            }
-          } catch (error) {
-            // Move might be invalid, but still try to play move sound
+          const isCheck = testChess.inCheck();
+          
+          // Play appropriate sound
+          if (isCastle) {
+            playSound('castle');
+          } else if (isPromotion) {
+            playSound('promotion');
+          } else if (isCheck) {
+            playSound('check');
+          } else if (isCapture) {
+            playSound('capture');
+          } else {
             playSound('move');
           }
           
-          onMove(selectedSquare, square);
+          // Handle premove vs regular move
+          const promotion = isPromotion ? (move.promotion as PieceType) : undefined;
+          
+          if (isPremove) {
+            // Store as premove instead of calling onMove immediately
+            setPremoves(prev => [...prev, { from: selectedSquare, to: square }]);
+            
+            // Clear selection after storing premove
+            if (externalSelectedSquare === undefined) {
+              setInternalSelectedSquare(null);
+            }
+          } else {
+            // Regular move - call onMove immediately
+            onMove(selectedSquare, square, promotion);
+            
+            // Clear selection after move
+            if (externalSelectedSquare === undefined) {
+              setInternalSelectedSquare(null);
+            }
+          }
+        } catch (error) {
+          // Invalid move - deselect or select new piece
+          const newPiece = boardState[rank]?.[file];
+          if (newPiece) {
+            // Try selecting the clicked piece instead
+            if (externalSelectedSquare === undefined) {
+              setInternalSelectedSquare(square);
+            }
+          } else {
+            // Clicked empty square - clear selection
+            if (externalSelectedSquare === undefined) {
+              setInternalSelectedSquare(null);
+            }
+          }
+          return;
+        }
+      } else {
+        // Clicked same square - deselect
+        if (externalSelectedSquare === undefined) {
+          setInternalSelectedSquare(null);
         }
       }
-      if (externalSelectedSquare === undefined) {
-        setInternalSelectedSquare(null);
-      }
     } else {
-      // Select a piece
+      // Select a piece (or start premove)
       const piece = boardState[rank]?.[file];
       if (piece) {
         // Rook castling: if rook is clicked and rookCastle is enabled, try to castle
         if (rookCastle && piece.type === 'r') {
           // Check if it's the player's rook
           const pieceColor = piece.color === 'white' ? 'white' : 'black';
-          if (!currentPlayerColor || pieceColor === currentPlayerColor) {
+          // Allow castling for player's piece OR if premove is enabled
+          const canCastle = !currentPlayerColor || pieceColor === currentPlayerColor || isPremove;
+          if (canCastle) {
             try {
               // Find the king of the same color
               const kingRank = pieceColor === 'white' ? 7 : 0; // Rank 7 for white, 0 for black
@@ -506,13 +758,28 @@ export function Chess960Board({
           }
         }
         
-        // Normal piece selection
+        // Normal piece selection (or premove selection)
+        // Allow selection if:
+        // 1. It's the player's piece (normal move)
+        // 2. Premove is enabled and it's not the player's turn (premove)
+        const pieceColor = piece.color === 'white' ? 'white' : 'black';
+        const isPlayerPiece = !currentPlayerColor || pieceColor === currentPlayerColor;
+        const canSelect = isPlayerPiece || isPremove;
+        
+        if (canSelect) {
+          // Select the piece - this shows destinations even for premoves
+          if (externalSelectedSquare === undefined) {
+            setInternalSelectedSquare(square);
+          }
+        }
+      } else {
+        // Clicked empty square - clear selection
         if (externalSelectedSquare === undefined) {
-          setInternalSelectedSquare(square);
+          setInternalSelectedSquare(null);
         }
       }
     }
-  }, [readOnly, onMove, selectedSquare, rankFileToSquare, boardState, effectiveLegalMoves, externalSelectedSquare, rookCastle, currentPlayerColor, chess, playSound, isClickEnabled, eraseArrowsOnClick, arrows, onArrowsChange]);
+  }, [readOnly, onMove, selectedSquare, rankFileToSquare, boardState, effectiveLegalMoves, externalSelectedSquare, rookCastle, currentPlayerColor, chess, playSound, isClickEnabled, eraseArrowsOnClick, arrows, onArrowsChange, enablePremove]);
 
   // Get piece image path - supports custom piece sets
   const getPieceImage = useCallback((piece: Piece): string => {
@@ -537,19 +804,92 @@ export function Chess960Board({
       return true;
     }
   }, [chess, currentPlayerColor]);
-
-  // Handle drag start
-  const handleDragStart = useCallback((e: React.DragEvent, rank: number, file: number) => {
-    if (readOnly) {
-      e.preventDefault();
+  
+  // Track previous turn state to detect when it BECOMES the player's turn
+  const prevIsPlayerTurnRef = useRef<boolean>(isPlayerTurn);
+  const premovesRef = useRef(premoves);
+  
+  // Keep premovesRef in sync with premoves state
+  useEffect(() => {
+    premovesRef.current = premoves;
+  }, [premoves]);
+  
+  // Execute premoves when it becomes the player's turn (transition from false to true)
+  useEffect(() => {
+    // Update ref
+    const wasPlayerTurn = prevIsPlayerTurnRef.current;
+    prevIsPlayerTurnRef.current = isPlayerTurn;
+    
+    // Only execute if it just became the player's turn (transition from false to true)
+    if (!enablePremove || premovesRef.current.length === 0 || !isPlayerTurn || wasPlayerTurn || !onMove || readOnly) {
       return;
     }
+    
+    // It just became the player's turn - try to execute the first premove
+    const firstPremove = premovesRef.current[0];
+    if (!firstPremove) return;
+    
+    // Check if the premove is still valid using current FEN
+    try {
+      const currentFen = fen || chess.fen();
+      const testChess = new Chess(currentFen);
+      const move = testChess.move({
+        from: firstPremove.from,
+        to: firstPremove.to,
+        promotion: 'q', // Default promotion for pawns (will be handled by onMove if needed)
+      });
+      
+      if (move) {
+        // Premove is valid - execute it
+        // Determine if it's a promotion
+        const piece = testChess.get(firstPremove.from as any);
+        const isPawn = piece?.type === 'p';
+        const targetRank = firstPremove.to[1];
+        const isPromotion = isPawn && (
+          (piece?.color === 'w' && targetRank === '8') ||
+          (piece?.color === 'b' && targetRank === '1')
+        );
+        
+        // Execute the move via onMove callback
+        onMove(firstPremove.from, firstPremove.to, isPromotion ? 'q' : undefined);
+        
+        // Remove this premove from the list
+        setPremoves(prev => prev.slice(1));
+        
+        // Clear selection
+        if (externalSelectedSquare === undefined) {
+          setInternalSelectedSquare(null);
+        }
+      } else {
+        // Premove is no longer valid - remove it
+        setPremoves(prev => prev.slice(1));
+      }
+    } catch (error) {
+      // Premove is invalid - remove it
+      setPremoves(prev => prev.slice(1));
+    }
+  }, [isPlayerTurn, fen, enablePremove, onMove, readOnly, chess, externalSelectedSquare]);
+
+  // Handle mouse/touch down on piece - start drag tracking
+  // Clicks are handled by squares, drags are handled here
+  const handlePieceMouseDown = useCallback((e: React.MouseEvent | React.TouchEvent, rank: number, file: number) => {
+    // Only handle left button clicks for mouse events
+    if (e.type === 'mousedown' && (e as React.MouseEvent).button !== 0) return;
+    
+    // Only handle single touch
+    if (e.type === 'touchstart' && (e as React.TouchEvent).touches.length > 1) return;
+    
+    if (readOnly || !isDragEnabled) {
+      return;
+    }
+
+    // Don't prevent default or stop propagation - let clicks pass through to square
+    // This allows click-to-move to work naturally
 
     const square = rankFileToSquare(rank, file);
     const piece = boardState[rank]?.[file];
     
     if (!piece) {
-      e.preventDefault();
       return;
     }
 
@@ -559,173 +899,565 @@ export function Chess960Board({
       if (pieceColor !== currentPlayerColor) {
         // Allow dragging opponent's piece only if premove is enabled and not player's turn
         if (!enablePremove || isPlayerTurn) {
-          e.preventDefault();
           return;
         }
       }
     }
 
-    setDraggedPiece({ square, piece });
-    if (externalSelectedSquare === undefined) {
-      setInternalSelectedSquare(square);
+    // Get event position for distance tracking
+    let clientX: number;
+    let clientY: number;
+    if (e.type === 'mousedown') {
+      const me = e as React.MouseEvent;
+      clientX = me.clientX;
+      clientY = me.clientY;
+    } else {
+      const te = e as React.TouchEvent;
+      if (te.touches.length === 0) return;
+      clientX = te.touches[0].clientX;
+      clientY = te.touches[0].clientY;
     }
 
-    // Set initial ghost piece position
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    // Store drag start position to detect if user actually dragged
+    // Use distance threshold to distinguish clicks from drags
     const boardRect = boardRef.current?.getBoundingClientRect();
     if (boardRect) {
-      setGhostPiecePosition({
-        x: e.clientX - boardRect.left - squareSize / 2,
-        y: e.clientY - boardRect.top - squareSize / 2,
-      });
+      dragStartPosRef.current = {
+        x: clientX,
+        y: clientY,
+      };
+      hasMovedRef.current = false;
+      
+      // Store the piece info in the ref for potential drag
+      // Also store origin target for touch event matching (to verify touchend matches touchstart)
+      draggedPieceRef.current = { 
+        square, 
+        piece,
+        originTarget: e.target as EventTarget | null,
+      };
+      
+      // Reset key change tracking for new drag
+      keyHasChangedRef.current = false;
+      
+      // If user has previously dragged, auto-start drag immediately
+      if (userPrefersDrag && dragDistanceThreshold > 0) {
+        // Set a flag to auto-start on first move
+        hasMovedRef.current = false; // Will be set to true once threshold is crossed
+      }
     }
+  }, [readOnly, isDragEnabled, rankFileToSquare, boardState, currentPlayerColor, enablePremove, isPlayerTurn, userPrefersDrag]);
 
-    // Create invisible drag image for smooth dragging
-    const canvas = document.createElement('canvas');
-    canvas.width = squareSize;
-    canvas.height = squareSize;
-    e.dataTransfer.setDragImage(canvas, squareSize / 2, squareSize / 2);
-    e.dataTransfer.effectAllowed = 'move';
-  }, [readOnly, isDragEnabled, rankFileToSquare, boardState, currentPlayerColor, enablePremove, isPlayerTurn, externalSelectedSquare, squareSize]);
+  // Track mouse movement during drag for ghost piece
+  // Use requestAnimationFrame to avoid excessive re-renders
+  // Declared early to be used by handleDragEnd
+  const ghostPieceRef = useRef<{ x: number; y: number } | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const lastDragOverSquareRef = useRef<Square | null>(null);
+  const draggedPieceRef = useRef<{ square: Square; piece: Piece; originTarget?: EventTarget | null } | null>(null);
+  const dragStartPosRef = useRef<{ x: number; y: number } | null>(null); // Track drag start position to distinguish click from drag
+  const hasMovedRef = useRef<boolean>(false); // Track if mouse moved during drag
+  const keyHasChangedRef = useRef<boolean>(false); // Track if drag has left the original square
 
-  // Handle drag over
+  // Handle drag over (now inlined in onDragOver for better control)
+  // Keeping this for potential future use, but primary handler is inline
   const handleDragOver = useCallback((e: React.DragEvent, rank: number, file: number) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    const square = rankFileToSquare(rank, file);
-    setDragOverSquare(square);
-    
-    // Update ghost piece position to follow cursor
-    if (boardRef.current && draggedPiece) {
-      const boardRect = boardRef.current.getBoundingClientRect();
-      setGhostPiecePosition({
-        x: e.clientX - boardRect.left - squareSize / 2,
-        y: e.clientY - boardRect.top - squareSize / 2,
-      });
+    // This is now handled inline in the onDragOver handler
+    // Keeping for backwards compatibility if needed
+  }, []);
+
+  // Handle drag end - defined early to be used by handleDrop
+  // Must clear ALL drag-related state to prevent ghost piece from sticking
+  const handleDragEnd = useCallback((e?: React.DragEvent) => {
+    // If a drop was successfully handled, don't clear state again (already cleared in handleDrop)
+    if (dropHandledRef.current) {
+      dropHandledRef.current = false;
     }
-  }, [rankFileToSquare, draggedPiece, squareSize]);
+    
+    // Always clear everything, regardless of where drag ended
+    setDraggedPiece(null);
+    draggedPieceRef.current = null;
+    setDragOverSquare(null);
+    // CRITICAL: Clear ghost piece immediately and synchronously
+    setGhostPiecePosition(null);
+    ghostPieceRef.current = null;
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    lastDragOverSquareRef.current = null;
+    dragStartPosRef.current = null;
+    hasMovedRef.current = false;
+    
+    // If drag ended without a valid drop, clear selection
+    if (externalSelectedSquare === undefined) {
+      setInternalSelectedSquare(null);
+    }
+  }, [externalSelectedSquare]);
 
   // Handle drop
   const handleDrop = useCallback((e: React.DragEvent, rank: number, file: number) => {
     e.preventDefault();
-    if (!draggedPiece) return;
-
+    e.stopPropagation();
+    
+    // CRITICAL: Stop the default drag behavior
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = 'move';
+    }
+    
+    // Use ref to get dragged piece (might be cleared by dragend, but ref persists)
+    const currentDraggedPiece = draggedPieceRef.current || draggedPiece;
+    
+    if (!currentDraggedPiece) {
+      handleDragEnd();
+      return;
+    }
+    
     const targetSquare = rankFileToSquare(rank, file);
     
     // Check for pawn promotion
     const targetPiece = boardState[rank]?.[file];
-    const sourcePiece = chess.get(draggedPiece.square as any);
-    const isPawn = sourcePiece?.type === 'p';
+    const sourcePiece = chess.get(currentDraggedPiece.square as any);
+    if (!sourcePiece) {
+      // No piece to move - clear drag state
+      handleDragEnd();
+      return;
+    }
+    
+    const isPawn = sourcePiece.type === 'p';
     const targetRank = targetSquare[1];
     const isPromotion = isPawn && (
-      (sourcePiece?.color === 'w' && targetRank === '8') ||
-      (sourcePiece?.color === 'b' && targetRank === '1')
+      (sourcePiece.color === 'w' && targetRank === '8') ||
+      (sourcePiece.color === 'b' && targetRank === '1')
     );
 
-    // Check if move is legal
+    // ALWAYS validate move using chess.js before allowing it (like click-to-move)
+    // This is CRITICAL - validate before any optimistic updates
+    let validMove: any = null;
+    let promotionPiece: PieceType | undefined = isPromotion ? 'q' : undefined;
+    
+    // Extra validation: Check if king is trying to move 2 squares (must be castling)
+    if (sourcePiece.type === 'k') {
+      const fileDiff = Math.abs(targetSquare.charCodeAt(0) - currentDraggedPiece.square.charCodeAt(0));
+      if (fileDiff === 2) {
+        // King moving 2 squares - must be castling, chess.js will validate if it's legal
+        // Don't reject here, let chess.js handle it
+      } else if (fileDiff > 2) {
+        // King trying to move more than 2 squares (not 1, not 2) - definitely illegal
+        handleDragEnd();
+        return;
+      } else if (fileDiff === 0) {
+        // King trying to stay in place - illegal
+        handleDragEnd();
+        return;
+      }
+    }
+    
     try {
-      const moves = chess.moves({ square: draggedPiece.square as any, verbose: true });
-      const isValid = moves.some((move: any) => move.to === targetSquare);
+      // Create a fresh chess instance for validation
+      const testChess = new Chess(chess.fen());
       
-      if (!isValid && !enablePremove) {
-        setDraggedPiece(null);
-        setDragOverSquare(null);
-        return;
+      // Validate the move - chess.js will throw or return null if illegal
+      validMove = testChess.move({ 
+        from: currentDraggedPiece.square as any, 
+        to: targetSquare,
+        promotion: promotionPiece
+      });
+      
+      if (!validMove) {
+        // Move is invalid according to chess.js
+        if (enablePremove && !isPlayerTurn) {
+          // Allow as premove (will be validated later)
+          if (onMove) {
+            setPremoves(prev => [...prev, { from: currentDraggedPiece.square, to: targetSquare }]);
+          }
+          handleDragEnd();
+          return;
+        } else {
+          // Invalid move - reject immediately
+          handleDragEnd();
+          return;
+        }
       }
-
-      // Handle promotion
-      if (isPromotion && onPromotionSelect) {
-        setPendingPromotion({ from: draggedPiece.square, to: targetSquare });
-        setShowPromotionDialog(true);
-        setDraggedPiece(null);
-        setDragOverSquare(null);
-        return;
-      }
-
-                // Make the move
-                if (isValid || enablePremove) {
-                  const promotionPiece = isPromotion ? 'q' : undefined; // Default to queen if no callback
-                  if (onMove) {
-                    if (enablePremove && !isPlayerTurn) {
-                      // Store as premove
-                      setPremoves(prev => [...prev, { from: draggedPiece.square, to: targetSquare }]);
-                    } else {
-                      // Determine move type for sound
-                      let isCastle = false;
-                      if (sourcePiece?.type === 'k') {
-                        const fileDiff = Math.abs(targetSquare.charCodeAt(0) - draggedPiece.square.charCodeAt(0));
-                        if (fileDiff === 2) {
-                          isCastle = true;
-                        }
-                      }
-                      
-                      // Check if move puts opponent in check
-                      try {
-                        const testChess = new Chess(chess.fen());
-                        const move = testChess.move({ from: draggedPiece.square as any, to: targetSquare });
-                        if (move) {
-                          const isCheck = testChess.inCheck();
-                          
-                          // Play appropriate sound
-                          if (isCastle) {
-                            playSound('castle');
-                          } else if (isPromotion) {
-                            playSound('promotion');
-                          } else if (isCheck) {
-                            playSound('check');
-                          } else if (targetPiece) {
-                            playSound('capture');
-                          } else {
-                            playSound('move');
-                          }
-                        }
-                      } catch (error) {
-                        // Move might be invalid, but still try to play move sound
-                        playSound('move');
-                      }
-                      
-                      onMove(draggedPiece.square, targetSquare, promotionPiece as PieceType);
-                    }
-                  }
-                }
     } catch (error) {
-      console.error('[Chess960Board] Error validating move:', error);
+      // chess.js threw an error - move is definitely illegal
+      if (enablePremove && !isPlayerTurn) {
+        // Allow as premove
+        if (onMove) {
+          setPremoves(prev => [...prev, { from: currentDraggedPiece.square, to: targetSquare }]);
+        }
+        handleDragEnd();
+        return;
+      } else {
+        // Invalid move - reject
+        handleDragEnd();
+        return;
+      }
     }
 
-    setDraggedPiece(null);
-    setDragOverSquare(null);
-    if (externalSelectedSquare === undefined) {
-      setInternalSelectedSquare(null);
-    }
-  }, [draggedPiece, rankFileToSquare, boardState, chess, enablePremove, isPlayerTurn, onMove, onPromotionSelect, externalSelectedSquare, playSound]);
-
-  // Handle drag end
-  const handleDragEnd = useCallback(() => {
-    setDraggedPiece(null);
-    setDragOverSquare(null);
-    setGhostPiecePosition(null);
-  }, []);
-
-  // Track mouse movement during drag for ghost piece
-  useEffect(() => {
-    if (!draggedPiece) {
-      setGhostPiecePosition(null);
+    // Move is valid - handle promotion dialog if needed
+    if (isPromotion && onPromotionSelect) {
+      setPendingPromotion({ from: currentDraggedPiece.square, to: targetSquare });
+      setShowPromotionDialog(true);
+      handleDragEnd();
       return;
     }
 
-    const handleMouseMove = (e: MouseEvent) => {
-      if (boardRef.current && draggedPiece) {
-        const boardRect = boardRef.current.getBoundingClientRect();
-        setGhostPiecePosition({
-          x: e.clientX - boardRect.left - squareSize / 2,
-          y: e.clientY - boardRect.top - squareSize / 2,
+    // Update promotion piece from the actual move
+    if (validMove && validMove.promotion) {
+      promotionPiece = validMove.promotion as PieceType;
+    }
+
+    // Make the move - only if it's our turn (not a premove)
+    if (onMove && isPlayerTurn) {
+      // Determine move type for sound
+      let isCastle = false;
+      if (sourcePiece.type === 'k') {
+        const fileDiff = Math.abs(targetSquare.charCodeAt(0) - currentDraggedPiece.square.charCodeAt(0));
+        if (fileDiff === 2) {
+          isCastle = true;
+        }
+      }
+      
+      const isCapture = !!validMove.captured;
+      const isCheck = validMove.san.includes('+') || validMove.san.includes('#');
+      
+      // Play appropriate sound
+      if (isCastle) {
+        playSound('castle');
+      } else if (isPromotion) {
+        playSound('promotion');
+      } else if (isCheck) {
+        playSound('check');
+      } else if (isCapture) {
+        playSound('capture');
+      } else {
+        playSound('move');
+      }
+      
+      // Optimistically make the move in internal chess instance for immediate visual update
+      // We already validated with testChess, so this should succeed
+      try {
+        // Store the FEN BEFORE making the optimistic move - we'll use this to detect reverts
+        const fenBeforeMove = chess.fen();
+        const normalizedFenBeforeMove = normalizeFen(fenBeforeMove);
+        preOptimisticFenRef.current = fenBeforeMove;
+        
+        
+        const optimisticMove = chess.move({ 
+          from: currentDraggedPiece.square as any, 
+          to: targetSquare,
+          promotion: promotionPiece
         });
+        
+        if (!optimisticMove) {
+          // This shouldn't happen since we validated, but handle it
+          console.error('[Chess960Board] Optimistic move failed after validation');
+          handleDragEnd();
+          return;
+        }
+        
+        // Get the new FEN from our chess instance
+        const newFen = chess.fen();
+        const normalizedNewFen = normalizeFen(newFen);
+        
+        // Parse the new board state
+        const newBoardState = parseFen(newFen);
+        
+        // Update board state IMMEDIATELY and synchronously
+        // We need to update both boardState and the refs at the same time
+        const currentBoardState = boardStateRef.current;
+        const prevStateCopy = currentBoardState.length > 0 
+          ? (currentBoardState.map(rank => rank.map(piece => piece ? { ...piece } : null)) as Piece[][])
+          : newBoardState;
+        
+        // Update refs FIRST (synchronous)
+        boardStateRef.current = newBoardState;
+        previousBoardStateRef.current = prevStateCopy;
+        lastFenRef.current = newFen;
+        
+        // Mark optimistic update BEFORE any async operations
+        optimisticUpdateRef.current = true;
+        dropHandledRef.current = true;
+        
+        // CRITICAL: Clear ghost piece IMMEDIATELY and synchronously before any state updates
+        // This ensures it disappears right away and doesn't stick to cursor
+        setGhostPiecePosition(null);
+        ghostPieceRef.current = null;
+        
+        // Then update React state (async, but refs are already set)
+        setPreviousBoardState(prevStateCopy);
+        setBoardState(newBoardState);
+        
+        // Clear drag state IMMEDIATELY - this ensures ghost piece disappears right away
+        handleDragEnd();
+        if (externalSelectedSquare === undefined) {
+          setInternalSelectedSquare(null);
+        }
+        
+        // Call parent's onMove callback AFTER everything is set
+        // The parent will process the move and send back the new FEN
+        // Our optimistic update protection will prevent reverting if parent sends old FEN
+        onMove(currentDraggedPiece.square, targetSquare, promotionPiece);
+      } catch (error) {
+        // This shouldn't happen since we validated, but handle it
+        console.error('[Chess960Board] Optimistic move error after validation:', error);
+        handleDragEnd();
+        return;
+      }
+    } else {
+      // Not our turn but move is valid - must be a premove (handled above)
+      // This shouldn't happen, but handle it gracefully
+      handleDragEnd();
+      return;
+    }
+  }, [draggedPiece, rankFileToSquare, boardState, chess, enablePremove, isPlayerTurn, onMove, onPromotionSelect, externalSelectedSquare, playSound, handleDragEnd]);
+
+  // Always attach mouse listeners - they check refs internally
+  // This ensures drag works even before draggedPiece state is set
+  useEffect(() => {
+
+    const handleMouseMove = (e: MouseEvent) => {
+      // Use ref to check if we have a potential drag (avoids stale closure)
+      if (!boardRef.current || !draggedPieceRef.current || !dragStartPosRef.current) {
+        return;
+      }
+      
+      // Check if mouse has moved enough to be considered a drag (not a click)
+      const dx = Math.abs(e.clientX - dragStartPosRef.current.x);
+      const dy = Math.abs(e.clientY - dragStartPosRef.current.y);
+      const dragThreshold = 5; // pixels
+      
+      if (dx > dragThreshold || dy > dragThreshold) {
+        // Mouse moved - this is a drag, not a click
+        if (!hasMovedRef.current) {
+          // First time moving - now set draggedPiece state and start drag
+          hasMovedRef.current = true;
+          if (draggedPieceRef.current) {
+            setDraggedPiece(draggedPieceRef.current);
+          }
+        }
+        
+        // Prevent default only when actually dragging
+        e.preventDefault();
+      }
+      
+      // Only update ghost piece if we're actually dragging (mouse moved)
+      if (hasMovedRef.current && draggedPieceRef.current) {
+        const boardRect = boardRef.current.getBoundingClientRect();
+        // Constrain ghost piece to board bounds
+        const x = Math.max(0, Math.min(
+          e.clientX - boardRect.left - squareSize / 2,
+          boardRect.width - squareSize
+        ));
+        const y = Math.max(0, Math.min(
+          e.clientY - boardRect.top - squareSize / 2,
+          boardRect.height - squareSize
+        ));
+        
+        // Update ref immediately for smooth tracking
+        ghostPieceRef.current = { x, y };
+        
+        // Throttle state updates using requestAnimationFrame
+        if (rafRef.current === null) {
+          rafRef.current = requestAnimationFrame(() => {
+            // Check ref again in callback (closure may be stale)
+            if (ghostPieceRef.current && draggedPieceRef.current) {
+              // Use functional update to avoid dependency on current state
+              setGhostPiecePosition(ghostPieceRef.current);
+            }
+            rafRef.current = null;
+          });
+        }
       }
     };
 
+    // Also handle touch move for mobile
+    const handleTouchMove = (e: TouchEvent) => {
+      if (boardRef.current && draggedPieceRef.current && e.touches.length > 0) {
+        const boardRect = boardRef.current.getBoundingClientRect();
+        const touch = e.touches[0];
+        const x = Math.max(0, Math.min(
+          touch.clientX - boardRect.left - squareSize / 2,
+          boardRect.width - squareSize
+        ));
+        const y = Math.max(0, Math.min(
+          touch.clientY - boardRect.top - squareSize / 2,
+          boardRect.height - squareSize
+        ));
+        
+        ghostPieceRef.current = { x, y };
+        
+        if (rafRef.current === null) {
+          rafRef.current = requestAnimationFrame(() => {
+            // Only update if still dragging
+            if (ghostPieceRef.current) {
+              setGhostPiecePosition((current) => {
+                return ghostPieceRef.current || current;
+              });
+            }
+            rafRef.current = null;
+          });
+        }
+      }
+    };
+
+    // Handle mouse up - complete drag and drop
+    const handleGlobalMouseUp = (e: MouseEvent | TouchEvent) => {
+      if (!boardRef.current) {
+        // Reset drag tracking even if no drag was active
+        dragStartPosRef.current = null;
+        hasMovedRef.current = false;
+        draggedPieceRef.current = null;
+        return;
+      }
+
+      // Get mouse/touch position
+      let clientX: number;
+      let clientY: number;
+      if (e instanceof MouseEvent) {
+        clientX = e.clientX;
+        clientY = e.clientY;
+      } else {
+        if (e.changedTouches.length === 0) {
+          dragStartPosRef.current = null;
+          hasMovedRef.current = false;
+          draggedPieceRef.current = null;
+          if (draggedPiece) {
+            handleDragEnd();
+          }
+          return;
+        }
+        clientX = e.changedTouches[0].clientX;
+        clientY = e.changedTouches[0].clientY;
+      }
+
+      // Check if this was a click (mouse didn't move) or a drag (mouse moved)
+      const hadMoved = hasMovedRef.current;
+      const hadDragStart = dragStartPosRef.current !== null;
+      const hadDraggedPieceState = draggedPiece !== null;
+      
+      // If this was just a click (no drag state set, mouse didn't move)
+      // Clear refs in next tick to allow onClick to fire first
+      if (!hadDraggedPieceState && hadDragStart && !hadMoved) {
+        // Check threshold to confirm it's a click
+        if (dragStartPosRef.current) {
+          const dx = Math.abs(clientX - dragStartPosRef.current.x);
+          const dy = Math.abs(clientY - dragStartPosRef.current.y);
+          const clickThreshold = 5; // pixels
+          
+          if (dx < clickThreshold && dy < clickThreshold) {
+            // This was definitely a click - clear refs after onClick has a chance to fire
+            // Use setTimeout to allow the React onClick event to fire first
+            setTimeout(() => {
+              dragStartPosRef.current = null;
+              hasMovedRef.current = false;
+              draggedPieceRef.current = null;
+            }, 0);
+            return;
+          }
+        }
+      }
+
+      // This was a drag - check if we have a dragged piece
+      if (!draggedPieceRef.current) {
+        dragStartPosRef.current = null;
+        hasMovedRef.current = false;
+        return;
+      }
+
+      const currentDraggedPiece = draggedPieceRef.current;
+
+      // This was a drag - process the drop
+      // Calculate which square the mouse is over
+      const boardRect = boardRef.current.getBoundingClientRect();
+      const relativeX = clientX - boardRect.left;
+      const relativeY = clientY - boardRect.top;
+
+      // Check if mouse is within board bounds
+      if (relativeX >= 0 && relativeX < boardRect.width && relativeY >= 0 && relativeY < boardRect.height) {
+        // Calculate which square
+        const file = Math.floor(relativeX / squareSize);
+        const displayRank = Math.floor(relativeY / squareSize);
+        
+        // Convert display coordinates to actual board coordinates
+        const actualRank = orientation === 'white' ? displayRank : 7 - displayRank;
+        const actualFile = orientation === 'white' ? file : 7 - file;
+        
+        // Clamp to valid range
+        if (actualRank >= 0 && actualRank < 8 && actualFile >= 0 && actualFile < 8) {
+          const targetSquare = rankFileToSquare(actualRank, actualFile);
+          
+          // Process the drop
+          processDrop(currentDraggedPiece.square, targetSquare);
+        } else {
+          // Mouse released outside board - cancel drag
+          handleDragEnd();
+        }
+      } else {
+        // Mouse released outside board - cancel drag
+        handleDragEnd();
+      }
+      
+      // Always clear drag tracking after mouseup
+      dragStartPosRef.current = null;
+      hasMovedRef.current = false;
+    };
+
+    // Process drop - extract from handleDrop logic
+    // We need to access variables from the component scope
+    // Since this is inside useEffect, we need to be careful about dependencies
+    const processDrop = (fromSquare: Square, targetSquare: Square) => {
+      // We'll use the existing handleDrop logic
+      // Calculate rank/file from targetSquare to match handleDrop signature
+      const targetRankNum = '87654321'.indexOf(targetSquare[1]);
+      const targetFileNum = 'abcdefgh'.indexOf(targetSquare[0]);
+      
+      // Create a minimal synthetic event just to match handleDrop signature
+      // handleDrop expects (e: React.DragEvent, rank: number, file: number)
+      const syntheticEvent = {
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        dataTransfer: null,
+      } as unknown as React.DragEvent;
+      
+      // Call handleDrop with the synthetic event
+      handleDrop(syntheticEvent, targetRankNum, targetFileNum);
+    };
+
+    // Always attach listeners - they check refs internally to see if drag is active
     window.addEventListener('mousemove', handleMouseMove);
-    return () => window.removeEventListener('mousemove', handleMouseMove);
-  }, [draggedPiece, squareSize]);
+    window.addEventListener('touchmove', handleTouchMove, { passive: false });
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+    window.addEventListener('touchend', handleGlobalMouseUp);
+    
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('touchmove', handleTouchMove);
+      window.removeEventListener('mouseup', handleGlobalMouseUp);
+      window.removeEventListener('touchend', handleGlobalMouseUp);
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      // Only clear ghost piece on unmount, not on every cleanup
+      // Otherwise it will clear during drag operations
+    };
+  }, [squareSize, orientation, rankFileToSquare, chess, boardState, enablePremove, isPlayerTurn, onMove, onPromotionSelect, externalSelectedSquare, handleDragEnd, handleDrop, handleSquareClick]); // Removed draggedPiece from deps - listeners check refs instead
+  
+  // Keep ref in sync with state
+  useEffect(() => {
+    draggedPieceRef.current = draggedPiece || draggedPieceRef.current;
+    
+    // Clean up when drag ends (draggedPiece becomes null)
+    if (!draggedPiece) {
+      setGhostPiecePosition(null);
+      ghostPieceRef.current = null;
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    }
+  }, [draggedPiece]);
 
   // Calculate valid moves for arrow start square (for snapping)
   const arrowValidMoves = useMemo(() => {
@@ -738,20 +1470,51 @@ export function Chess960Board({
     }
   }, [arrowStart, snapToValidMoves, chess, readOnly]);
 
-  // Handle right click - for square highlighting and arrow start
-  const handleContextMenu = useCallback((e: React.MouseEvent, rank: number, file: number) => {
+  // Handle right click - for square highlighting, arrow start, and destination display
+  // Right-click is handled in mousedown, not contextmenu, to prevent move calculation
+  // It immediately cancels any drag/draw and clears selection
+  const handleRightClick = useCallback((e: React.MouseEvent, rank: number, file: number) => {
+    // Prevent context menu
     e.preventDefault();
+    e.stopPropagation();
+    
     if (readOnly) return;
 
-    const square = rankFileToSquare(rank, file);
+    // CRITICAL: Clear selection IMMEDIATELY FIRST to prevent any premove calculation
+    // This must be the very first thing we do
+    if (externalSelectedSquare === undefined) {
+      setInternalSelectedSquare(null);
+    }
     
-    // Cancel premoves on right click
+    // Cancel premoves immediately
     if (premoves.length > 0) {
       setPremoves([]);
-      return;
+    }
+    
+    // Clear right-click hover
+    setRightClickHoverSquare(null);
+
+    // Cancel any ongoing drag
+    if (draggedPiece) {
+      handleDragEnd();
+    }
+    
+    // Cancel any ongoing arrow drawing
+    if (isDrawingArrow) {
+      setIsDrawingArrow(false);
+      setArrowStart(null);
+      setDragOverSquare(null);
     }
 
-    // Toggle square highlight or start arrow
+    const square = rankFileToSquare(rank, file);
+    const piece = boardState[rank]?.[file];
+    
+    // If right-clicking on a piece, show destinations
+    if (piece && showDestinations) {
+      setRightClickHoverSquare(square);
+    }
+
+    // Handle arrow drawing or square highlighting
     if (onArrowsChange) {
       // Start arrow drawing
       if (!arrowStart) {
@@ -779,18 +1542,26 @@ export function Chess960Board({
         setDragOverSquare(null);
       }
     } else {
-      // Simple square highlighting
+      // Simple square highlighting - toggle on/off
       setRightClickedSquares(prev => {
         const color = 'rgba(0, 0, 255, 0.4)';
         const isHighlighted = prev[square]?.backgroundColor === color;
         if (isHighlighted) {
+          // Remove highlight
           const { [square]: _, ...rest } = prev;
           return rest;
         }
+        // Add highlight
         return { ...prev, [square]: { backgroundColor: color } };
       });
     }
-  }, [readOnly, rankFileToSquare, premoves, onArrowsChange, arrowStart, arrows, snapToValidMoves, dragOverSquare, arrowValidMoves]);
+  }, [readOnly, rankFileToSquare, premoves, boardState, onArrowsChange, arrowStart, arrows, snapToValidMoves, dragOverSquare, arrowValidMoves, showDestinations, externalSelectedSquare, draggedPiece, isDrawingArrow, handleDragEnd]);
+  
+  // Context menu handler - just prevent default
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
 
   // Handle mouse enter for arrow drawing with snapping
   const handleMouseEnter = useCallback((rank: number, file: number) => {
@@ -806,25 +1577,6 @@ export function Chess960Board({
       }
     }
   }, [isDrawingArrow, arrowStart, rankFileToSquare, snapToValidMoves, arrowValidMoves]);
-
-  // Handle mouse move for arrow drawing with snapping (for better mouse tracking)
-  const handleMouseMove = useCallback((e: React.MouseEvent, rank: number, file: number) => {
-    if (isDrawingArrow && arrowStart && snapToValidMoves) {
-      const square = rankFileToSquare(rank, file);
-      
-      // If this square is a valid move, snap to it
-      if (arrowValidMoves.has(square)) {
-        setDragOverSquare(square);
-      } else {
-        // Find nearest valid move square
-        const currentSquare = rankFileToSquare(rank, file);
-        const nearestValid = findNearestValidSquare(currentSquare, arrowValidMoves);
-        if (nearestValid) {
-          setDragOverSquare(nearestValid);
-        }
-      }
-    }
-  }, [isDrawingArrow, arrowStart, snapToValidMoves, arrowValidMoves, rankFileToSquare]);
 
   // Helper to find nearest valid square for snapping
   const findNearestValidSquare = useCallback((targetSquare: Square, validMoves: Set<Square>): Square | null => {
@@ -850,6 +1602,34 @@ export function Chess960Board({
     // Only snap if within reasonable distance (2 squares)
     return minDistance <= 2 ? nearest : null;
   }, [squareToRankFile]);
+
+  // Handle mouse move for arrow drawing with snapping (for better mouse tracking)
+  // Use ref to track last square to avoid excessive updates
+  // (lastDragOverSquareRef already declared above)
+  const handleMouseMove = useCallback((e: React.MouseEvent, rank: number, file: number) => {
+    if (isDrawingArrow && arrowStart && snapToValidMoves) {
+      const square = rankFileToSquare(rank, file);
+      
+      let targetSquare: Square | null = null;
+      
+      // If this square is a valid move, snap to it
+      if (arrowValidMoves.has(square)) {
+        targetSquare = square;
+      } else {
+        // Find nearest valid move square
+        const nearestValid = findNearestValidSquare(square, arrowValidMoves);
+        if (nearestValid) {
+          targetSquare = nearestValid;
+        }
+      }
+      
+      // Only update if changed to avoid infinite loops
+      if (targetSquare && targetSquare !== lastDragOverSquareRef.current) {
+        lastDragOverSquareRef.current = targetSquare;
+        setDragOverSquare(targetSquare);
+      }
+    }
+  }, [isDrawingArrow, arrowStart, snapToValidMoves, arrowValidMoves, rankFileToSquare, findNearestValidSquare]);
 
   // Touch ignore radius helper
   const shouldIgnoreTouch = useCallback((e: React.TouchEvent, rank: number, file: number): boolean => {
@@ -1095,10 +1875,25 @@ export function Chess960Board({
     <div 
       ref={boardRef}
       className="relative inline-block"
-      style={{ width: internalWidth, height: internalWidth }}
+      style={{ 
+        width: `${internalWidth}px`, 
+        height: `${internalWidth}px`,
+        position: 'relative',
+      }}
+      onContextMenu={(e) => {
+        // Prevent context menu on the entire board
+        e.preventDefault();
+      }}
     >
       {/* Board squares */}
-      <div className="relative w-full h-full">
+      <div 
+        className="relative w-full h-full"
+        style={{
+          width: '100%',
+          height: '100%',
+          position: 'relative',
+        }}
+      >
         {/* Render display positions (screen coordinates) */}
         {Array.from({ length: 8 }, (_, displayRank) =>
           Array.from({ length: 8 }, (_, displayFile) => {
@@ -1118,6 +1913,7 @@ export function Chess960Board({
             const piece = boardState[actualRank]?.[actualFile];
             const square = rankFileToSquare(actualRank, actualFile);
             const isSelected = selectedSquare === square;
+            const isRightClickHover = rightClickHoverSquare === square;
             const isLastMoveFrom = lastMove && lastMove[0] === square;
             const isLastMoveTo = lastMove && lastMove[1] === square;
             const isLegalMove = effectiveLegalMoves.includes(square);
@@ -1134,8 +1930,8 @@ export function Chess960Board({
               squareBgColor = 'rgba(255, 255, 0, 0.6)'; // Bright yellow for drag over
             } else if (isLastMoveFrom || isLastMoveTo) {
               squareBgColor = 'rgba(255, 255, 0, 0.4)'; // Yellow for last move
-            } else if (isSelected) {
-              squareBgColor = 'rgba(255, 165, 0, 0.5)'; // Orange for selected
+            } else if (isSelected || isRightClickHover) {
+              squareBgColor = 'rgba(255, 165, 0, 0.5)'; // Orange for selected or right-click hover
             } else if (showDestinations && isLegalMove) {
               // Highlight destination squares more subtly when showing destinations
               // The dot/ring indicators provide the main visual feedback
@@ -1147,64 +1943,135 @@ export function Chess960Board({
             return (
               <div
                 key={`${displayRank}-${displayFile}`}
+                data-square={square}
                 className="absolute transition-colors duration-150"
                 style={{
                   left: `${displayFile * squareSize}px`,
                   top: `${displayRank * squareSize}px`,
-                  width: squareSize,
-                  height: squareSize,
+                  width: `${squareSize}px`,
+                  height: `${squareSize}px`,
                   backgroundColor: squareBgColor,
                   border: isSelected ? '2px solid #f59e0b' : isInCheckSquare ? '3px solid #ff0000' : 'none',
-                  cursor: readOnly ? 'default' : piece && isDragEnabled ? 'grab' : (isClickEnabled && (piece || isLegalMove) ? 'pointer' : 'default'),
+                  cursor: readOnly 
+                    ? 'default' 
+                    : piece 
+                      ? (isDragEnabled ? 'grab' : (isClickEnabled ? 'pointer' : 'default'))
+                      : (isClickEnabled && isLegalMove ? 'pointer' : 'default'),
+                  position: 'absolute',
+                  userSelect: 'none',
+                  WebkitUserSelect: 'none',
                 }}
-                onClick={() => handleSquareClick(actualRank, actualFile)}
+                onClick={(e) => {
+                  // Don't handle right-clicks here - they're handled in onMouseDown
+                  if ((e as React.MouseEvent).button === 2) {
+                    return;
+                  }
+                  
+                  // Handle click on square - this is where clicks are handled
+                  // Clicks are always handled at the square level, even when clicking on a piece
+                  
+                  // Check if this was actually a drag - if so, ignore the click
+                  // CRITICAL: Check refs directly since state updates are async
+                  const wasDrag = draggedPieceRef.current !== null && hasMovedRef.current;
+                  
+                  // If it was a drag, don't handle click
+                  if (wasDrag) {
+                    // Clear drag refs since drag is complete
+                    draggedPieceRef.current = null;
+                    dragStartPosRef.current = null;
+                    hasMovedRef.current = false;
+                    return;
+                  }
+                  
+                  // Clear any drag refs that might be lingering (from a click, not drag)
+                  draggedPieceRef.current = null;
+                  dragStartPosRef.current = null;
+                  hasMovedRef.current = false;
+                  
+                  // Clear right-click hover on left click
+                  setRightClickHoverSquare(null);
+                  
+                  // Handle the click - this works for both pieces and empty squares
+                  handleSquareClick(actualRank, actualFile, e);
+                }}
+                onMouseDown={(e) => {
+                  // Handle right-click in mousedown
+                  // This must happen BEFORE any other handlers to prevent move calculation
+                  if (e.button === 2 || e.shiftKey) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleRightClick(e, actualRank, actualFile);
+                    return;
+                  }
+                  // For left clicks, don't prevent default - allow dragging
+                }}
                 onTouchStart={(e) => handleTouchStart(e, actualRank, actualFile)}
-                onContextMenu={(e) => handleContextMenu(e, actualRank, actualFile)}
-                onDragOver={(e) => handleDragOver(e, actualRank, actualFile)}
-                onDragLeave={() => setDragOverSquare(null)}
-                onDrop={(e) => handleDrop(e, actualRank, actualFile)}
+                onContextMenu={handleContextMenu}
                 onMouseEnter={(e) => {
+                  // Update drag over square during drag (for visual feedback)
+                  if (draggedPiece) {
+                    const square = rankFileToSquare(actualRank, actualFile);
+                    setDragOverSquare(square);
+                  }
                   handleMouseEnter(actualRank, actualFile);
                   if (isDrawingArrow) {
                     handleMouseMove(e, actualRank, actualFile);
                   }
+                  // Show destinations on right-click drag/hover
+                  if (e.buttons === 2 && !readOnly && showDestinations) {
+                    const square = rankFileToSquare(actualRank, actualFile);
+                    const piece = boardState[actualRank]?.[actualFile];
+                    if (piece) {
+                      setRightClickHoverSquare(square);
+                    }
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  // Clear right-click hover when mouse leaves (but only if not right-dragging)
+                  if (e.buttons !== 2) {
+                    setRightClickHoverSquare(null);
+                  }
                 }}
                 onMouseMove={(e) => {
+                  // Update drag over square during drag (for visual feedback)
+                  if (draggedPiece) {
+                    const square = rankFileToSquare(actualRank, actualFile);
+                    setDragOverSquare(square);
+                  }
                   if (isDrawingArrow) {
                     handleMouseMove(e, actualRank, actualFile);
                   }
                 }}
-                draggable={false}
               >
-                {/* Legal move indicator (dot for empty squares) */}
+                {/* Legal move indicator (dot for empty squares) - subtle */}
                 {showDestinations && isLegalMove && !piece && !isSelected && (
                   <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                     <div 
                       className="rounded-full transition-opacity duration-150"
                       style={{
-                        width: squareSize * 0.4,
-                        height: squareSize * 0.4,
-                        backgroundColor: 'rgba(20, 85, 30, 0.5)',
-                        boxShadow: '0 0 4px rgba(20, 85, 30, 0.6)',
+                        width: squareSize * 0.25,
+                        height: squareSize * 0.25,
+                        backgroundColor: 'rgba(0, 0, 0, 0.15)',
+                        boxShadow: '0 0 2px rgba(0, 0, 0, 0.3)',
                       }}
                     />
                   </div>
                 )}
                 
-                {/* Capture indicator (ring around piece for captures) */}
+                {/* Capture indicator (ring around piece for captures) - subtle */}
                 {showDestinations && isLegalMove && piece && (
                   <div 
                     className="absolute inset-0 pointer-events-none"
                     style={{
-                      border: '3px solid rgba(124, 252, 0, 0.8)',
+                      border: '2px solid rgba(0, 0, 0, 0.25)',
                       borderRadius: '50%',
-                      boxShadow: '0 0 8px rgba(124, 252, 0, 0.6), inset 0 0 8px rgba(124, 252, 0, 0.3)',
+                      boxShadow: 'inset 0 0 4px rgba(0, 0, 0, 0.2), 0 0 4px rgba(0, 0, 0, 0.2)',
                     }}
                   />
                 )}
 
                 {/* Piece - hide if it's being animated from another square or in blindfold mode */}
-                {piece && !isDragged && !blindfold && (() => {
+                {piece && !blindfold && (() => {
                   const pieceKey = `${square}-${piece.color}-${piece.type}`;
                   const isAnimating = animatingPieces.has(pieceKey);
                   const isBeingDragged = draggedPiece?.square === square;
@@ -1214,14 +2081,35 @@ export function Chess960Board({
                     return null;
                   }
                   
+                  // Hide piece completely when being dragged (we show ghost piece instead)
+                  if (isBeingDragged) {
+                    return null;
+                  }
+                  
+                  const pieceDraggable = !readOnly && isDragEnabled;
+                  
                   return (
                     <div
-                                 className="w-full h-full flex items-center justify-center"
-                                 draggable={!readOnly && isDragEnabled}
-                      onDragStart={(e) => handleDragStart(e, actualRank, actualFile)}
-                      onDragEnd={handleDragEnd}
+                      className="w-full h-full flex items-center justify-center"
+                      onMouseDown={(e) => {
+                        // Use mouse down to start drag
+                        // KEY: Don't prevent default or stop propagation - let clicks pass to square
+                        // Clicks are handled by squares, not pieces
+                        if (pieceDraggable && e.button === 0) {
+                          handlePieceMouseDown(e, actualRank, actualFile);
+                          // Don't prevent default - let click event fire normally
+                          // The square will handle the click if it's not a drag
+                        } else if (e.button === 2) {
+                          e.preventDefault(); // Prevent context menu on right click
+                        }
+                      }}
+                      // No onClick on piece - let clicks bubble to square
+                      // Standard drag-and-drop behavior
                       style={{
-                        cursor: readOnly ? 'default' : 'grab',
+                        cursor: readOnly ? 'default' : isDragEnabled ? 'grab' : (isClickEnabled ? 'pointer' : 'default'),
+                        pointerEvents: readOnly ? 'none' : 'auto',
+                        userSelect: 'none',
+                        WebkitUserSelect: 'none',
                       }}
                     >
                       <img
@@ -1229,9 +2117,12 @@ export function Chess960Board({
                         alt={`${piece.color} ${piece.type}`}
                         className="w-full h-full object-contain pointer-events-none select-none transition-all duration-150"
                         style={{
-                          transform: isSelected ? 'scale(1.1)' : 'scale(1)',
+                          transform: isSelected ? 'scale(1.05)' : 'scale(1)',
                           zIndex: isSelected ? 10 : 1,
-                          opacity: isBeingDragged ? 0.3 : 1, // Make original piece semi-transparent when dragging
+                          userSelect: 'none',
+                          WebkitUserSelect: 'none',
+                          MozUserSelect: 'none',
+                          pointerEvents: 'none', // Ensure image doesn't block mouse events
                         }}
                         draggable={false}
                       />
@@ -1376,19 +2267,20 @@ export function Chess960Board({
           );
         })}
         
-        {/* Ghost piece during drag */}
+        {/* Ghost piece during drag - only show when actively dragging */}
         {draggedPiece && ghostPiecePosition && (
           <div
             className="absolute pointer-events-none"
             style={{
               left: `${ghostPiecePosition.x}px`,
               top: `${ghostPiecePosition.y}px`,
-              width: squareSize,
-              height: squareSize,
-              zIndex: 200,
-              opacity: 0.7,
-              transform: 'scale(1.1)',
-              filter: 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.3))',
+              width: `${squareSize}px`,
+              height: `${squareSize}px`,
+              zIndex: 1000,
+              opacity: 0.85,
+              transform: 'scale(1.05)',
+              filter: 'drop-shadow(0 4px 12px rgba(0, 0, 0, 0.4))',
+              transition: 'none', // No transition during drag for smooth following
             }}
           >
             <img
@@ -1396,6 +2288,11 @@ export function Chess960Board({
               alt={`${draggedPiece.piece.color} ${draggedPiece.piece.type}`}
               className="w-full h-full object-contain select-none"
               draggable={false}
+              style={{
+                pointerEvents: 'none',
+                userSelect: 'none',
+                WebkitUserSelect: 'none',
+              }}
             />
           </div>
         )}
@@ -1432,4 +2329,3 @@ export function Chess960Board({
     </div>
   );
 }
-
